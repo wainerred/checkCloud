@@ -8,456 +8,344 @@ Requirements:
     pip install requests openpyxl
 
 Usage:
-    export SELECTEL_TOKEN="your_iam_token_here"
-    python selectel_servers.py
-
-Or pass token directly:
-    python selectel_servers.py --token YOUR_TOKEN
+    python selectel_servers.py \
+        --username SERVICE_USER \
+        --account  ACCOUNT_ID  \
+        --password PASSWORD
 """
 
-import os
-import sys
-import json
-import argparse
-import requests
+import os, sys, json, argparse, requests
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+KEYSTONE_URL   = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+DEDICATED_BASE = "https://api.selectel.ru/servers/v2"
+RESELL_BASE    = "https://api.selectel.ru/vpc/resell/v2"
 
-DEDICATED_BASE_URL = "https://api.selectel.ru/servers/v2"
-CLOUD_BASE_URL     = "https://api.selectel.ru/vpc/resell/v2"
-CLOUD_NOVA_URL     = "https://api.selectel.ru"   # Nova compute API
 
-# ─── Auth helpers ─────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
-def get_token():
-    """Get IAM token from env or CLI arg."""
-    parser = argparse.ArgumentParser(description="Selectel server inventory")
-    parser.add_argument("--token", help="Selectel IAM token")
-    parser.add_argument(
-        "--keystone-token",
-        help="Keystone token for cloud servers (optional, auto-fetched if not provided)"
-    )
-    args = parser.parse_args()
-    token = args.token or os.environ.get("SELECTEL_TOKEN")
-    if not token:
-        print("ERROR: Provide token via --token or SELECTEL_TOKEN env variable")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--username", default=os.environ.get("SEL_USERNAME"))
+    p.add_argument("--account",  default=os.environ.get("SEL_ACCOUNT"))
+    p.add_argument("--password", default=os.environ.get("SEL_PASSWORD"))
+    args = p.parse_args()
+    missing = [k for k, v in [("--username", args.username), ("--account", args.account), ("--password", args.password)] if not v]
+    if missing:
+        print(f"ERROR: Missing: {', '.join(missing)}")
+        print("Use CLI args or env vars: SEL_USERNAME, SEL_ACCOUNT, SEL_PASSWORD")
         sys.exit(1)
-    return token, args.keystone_token
+    return args
 
 
-def auth_headers(token):
-    return {"X-Auth-Token": token, "Content-Type": "application/json"}
+def get_account_token(username, account_id, password):
+    """Account-scoped IAM token for dedicated servers and project listing."""
+    payload = {"auth": {"identity": {"methods": ["password"], "password": {"user": {
+        "name": username, "domain": {"name": account_id}, "password": password
+    }}}, "scope": {"domain": {"name": account_id}}}}
+    r = requests.post(KEYSTONE_URL, json=payload, timeout=20)
+    r.raise_for_status()
+    token = r.headers.get("X-Subject-Token")
+    if not token:
+        raise RuntimeError("No X-Subject-Token in response headers")
+    return token
 
 
-# ─── Dedicated servers ────────────────────────────────────────────────────────
+def get_project_token(username, account_id, password, project_name):
+    """Project-scoped IAM token + service catalog for OpenStack API."""
+    payload = {"auth": {"identity": {"methods": ["password"], "password": {"user": {
+        "name": username, "domain": {"name": account_id}, "password": password
+    }}}, "scope": {"project": {"name": project_name, "domain": {"name": account_id}}}}}
+    r = requests.post(KEYSTONE_URL, json=payload, timeout=20)
+    r.raise_for_status()
+    token   = r.headers.get("X-Subject-Token")
+    catalog = r.json().get("token", {}).get("catalog", [])
+    return token, catalog
 
-def fetch_dedicated_servers(token):
-    """Fetch all dedicated server resources from Selectel API."""
-    headers = auth_headers(token)
+
+def get_nova_url(catalog):
+    for svc in catalog:
+        if svc.get("type") == "compute":
+            for ep in svc.get("endpoints", []):
+                if ep.get("interface") == "public":
+                    return ep.get("url", "").rstrip("/")
+    return None
+
+
+def list_projects(account_token):
+    r = requests.get(f"{RESELL_BASE}/projects", headers={"X-Auth-Token": account_token}, timeout=15)
+    r.raise_for_status()
+    raw = r.json()
+    return raw if isinstance(raw, list) else raw.get("projects", [])
+
+
+# ── Dedicated servers ─────────────────────────────────────────────────────────
+
+def fetch_dedicated(account_token):
+    h = {"X-Auth-Token": account_token}
     servers = []
 
-    # Get resources list (model=server)
-    try:
-        resp = requests.get(
-            f"{DEDICATED_BASE_URL}/resource",
-            headers=headers,
-            params={"model": "server", "limit": 1000},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        resources = data.get("result", [])
-    except Exception as e:
-        print(f"  [!] Could not fetch dedicated server resources: {e}")
-        return []
-
-    # Get location names
     locations = {}
     try:
-        loc_resp = requests.get(f"{DEDICATED_BASE_URL}/location", headers=headers, timeout=15)
-        if loc_resp.ok:
-            for loc in loc_resp.json().get("result", []):
+        r = requests.get(f"{DEDICATED_BASE}/location", headers=h, timeout=15)
+        if r.ok:
+            for loc in r.json().get("result", []):
                 locations[loc["uuid"]] = loc.get("name", loc["uuid"])
     except Exception:
         pass
 
+    try:
+        r = requests.get(f"{DEDICATED_BASE}/resource", headers=h,
+                         params={"model": "server", "limit": 1000}, timeout=30)
+        r.raise_for_status()
+        resources = r.json().get("result", [])
+    except Exception as e:
+        print(f"  [!] Dedicated resources error: {e}")
+        return []
+
     for res in resources:
-        resource_uuid = res.get("uuid", "")
-        server_info = {}
+        uuid = res.get("uuid", "")
 
-        # Get detailed server resource info
+        hw = {}
         try:
-            detail_resp = requests.get(
-                f"{DEDICATED_BASE_URL}/resource/{resource_uuid}/server",
-                headers=headers,
-                timeout=15,
-            )
-            if detail_resp.ok:
-                server_info = detail_resp.json().get("result", {})
-        except Exception:
-            pass
+            r = requests.get(f"{DEDICATED_BASE}/resource/{uuid}/server", headers=h, timeout=15)
+            if r.ok: hw = r.json().get("result", {})
+        except Exception: pass
 
-        # Get OS info
-        os_info = ""
+        os_name = "—"
         try:
-            os_resp = requests.get(
-                f"{DEDICATED_BASE_URL}/resource/{resource_uuid}/os",
-                headers=headers,
-                timeout=15,
-            )
-            if os_resp.ok:
-                os_data = os_resp.json().get("result", {})
-                os_info = os_data.get("name", "") or os_data.get("os_name", "")
-        except Exception:
-            pass
+            r = requests.get(f"{DEDICATED_BASE}/resource/{uuid}/os", headers=h, timeout=15)
+            if r.ok:
+                d = r.json().get("result", {})
+                os_name = d.get("name") or d.get("os_name") or "—"
+        except Exception: pass
 
-        # Get IP addresses
         ip_list = []
         try:
-            ip_resp = requests.get(
-                f"{DEDICATED_BASE_URL}/resource/{resource_uuid}/ip",
-                headers=headers,
-                timeout=15,
-            )
-            if ip_resp.ok:
-                for ip_item in ip_resp.json().get("result", []):
-                    ip_addr = ip_item.get("ip_address") or ip_item.get("address", "")
-                    if ip_addr:
-                        ip_list.append(ip_addr)
-        except Exception:
-            pass
+            r = requests.get(f"{DEDICATED_BASE}/resource/{uuid}/ip", headers=h, timeout=15)
+            if r.ok:
+                for item in r.json().get("result", []):
+                    addr = item.get("ip_address") or item.get("address", "")
+                    if addr: ip_list.append(addr)
+        except Exception: pass
 
-        # Extract billing date
-        billing_date = ""
-        paid_till = res.get("paid_till") or res.get("payment_date") or res.get("expires")
-        if paid_till:
+        billing = "—"
+        raw_date = res.get("paid_till") or res.get("payment_date") or res.get("expires")
+        if raw_date:
             try:
-                dt = datetime.fromisoformat(str(paid_till).replace("Z", "+00:00"))
-                billing_date = dt.strftime("%Y-%m-%d")
+                dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                billing = dt.strftime("%d.%m.%Y")
             except Exception:
-                billing_date = str(paid_till)
+                billing = str(raw_date)
 
-        # Build configuration string
-        config_parts = []
-        if server_info:
-            cpu = server_info.get("cpu_info") or server_info.get("cpu", "")
-            ram = server_info.get("ram") or server_info.get("memory", "")
-            disk = server_info.get("disk_info") or server_info.get("storage", "")
-            if cpu:
-                config_parts.append(f"CPU: {cpu}")
-            if ram:
-                config_parts.append(f"RAM: {ram}")
-            if disk:
-                config_parts.append(f"Storage: {disk}")
+        parts = []
+        if hw.get("cpu_info"):  parts.append(f"CPU: {hw['cpu_info']}")
+        if hw.get("ram"):       parts.append(f"RAM: {hw['ram']}")
+        if hw.get("disk_info"): parts.append(f"Disk: {hw['disk_info']}")
+        config = " | ".join(parts) if parts else res.get("service_name", "—")
 
-        service_name = res.get("name") or res.get("title", "")
-        location_uuid = res.get("location_uuid") or res.get("location", "")
-        location_name = locations.get(location_uuid, location_uuid)
-
+        loc_uuid = res.get("location_uuid") or res.get("location", "")
         servers.append({
-            "name":          service_name or resource_uuid,
-            "ip":            ", ".join(ip_list) if ip_list else "—",
-            "configuration": " | ".join(config_parts) if config_parts else res.get("service_name", "—"),
-            "region":        location_name or "—",
-            "os":            os_info or "—",
-            "billing_date":  billing_date or "—",
-            "uuid":          resource_uuid,
-            "status":        res.get("state", res.get("status", "—")),
+            "name":          res.get("name") or res.get("title") or uuid,
+            "ip":            ", ".join(ip_list) or "—",
+            "configuration": config,
+            "region":        locations.get(loc_uuid, loc_uuid) or "—",
+            "os":            os_name,
+            "billing_date":  billing,
         })
 
     return servers
 
 
-# ─── Cloud servers ────────────────────────────────────────────────────────────
+# ── Cloud servers ─────────────────────────────────────────────────────────────
 
-def get_keystone_token(iam_token):
-    """Exchange IAM token for Keystone token to access OpenStack APIs."""
-    url = "https://api.selectel.ru/identity/v3/auth/tokens"
-    payload = {
-        "auth": {
-            "identity": {
-                "methods": ["application_credential"],
-                "application_credential": {"token": iam_token}
-            }
-        }
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-        if resp.ok:
-            return resp.headers.get("X-Subject-Token")
-    except Exception:
-        pass
+def fetch_cloud(username, account_id, password, projects):
+    all_servers = []
 
-    # Alternative: direct token auth
-    try:
-        payload2 = {
-            "auth": {
-                "identity": {
-                    "methods": ["token"],
-                    "token": {"id": iam_token}
-                }
-            }
-        }
-        resp2 = requests.post(url, json=payload2, timeout=15)
-        if resp2.ok:
-            return resp2.headers.get("X-Subject-Token")
-    except Exception:
-        pass
+    for proj in projects:
+        proj_name = proj.get("name", "")
+        if not proj_name:
+            continue
+        print(f"    → project: {proj_name}")
 
-    return None
-
-
-def fetch_cloud_projects(token):
-    """Fetch cloud projects to get endpoints."""
-    headers = auth_headers(token)
-    try:
-        resp = requests.get(
-            f"{CLOUD_BASE_URL}/projects",
-            headers=headers,
-            timeout=15,
-        )
-        if resp.ok:
-            return resp.json() if isinstance(resp.json(), list) else resp.json().get("projects", [])
-    except Exception:
-        pass
-    return []
-
-
-def fetch_cloud_servers(iam_token, keystone_token=None):
-    """Fetch all cloud (virtual) servers via Selectel resell + OpenStack Nova API."""
-    headers = auth_headers(iam_token)
-    servers = []
-
-    # Try resell v2 API first for project list
-    projects = []
-    try:
-        resp = requests.get(f"{CLOUD_BASE_URL}/projects", headers=headers, timeout=15)
-        if resp.ok:
-            raw = resp.json()
-            projects = raw if isinstance(raw, list) else raw.get("projects", raw.get("result", []))
-    except Exception as e:
-        print(f"  [!] Could not fetch cloud projects: {e}")
-
-    if not keystone_token:
-        keystone_token = get_keystone_token(iam_token)
-
-    if not keystone_token:
-        print("  [!] Could not obtain Keystone token for cloud API. "
-              "Try passing --keystone-token manually.")
-        return []
-
-    ks_headers = {
-        "X-Auth-Token": keystone_token,
-        "Content-Type": "application/json",
-    }
-
-    # Selectel pools / regions
-    regions = [
-        ("ru-1", "https://api.selectel.ru/servers/api/v2/servers"),
-        ("ru-2", "https://api.selectel.ru/servers/api/v2/servers"),
-        ("ru-3", "https://api.selectel.ru/servers/api/v2/servers"),
-        ("ru-7", "https://api.selectel.ru/servers/api/v2/servers"),
-        ("ru-9", "https://api.selectel.ru/servers/api/v2/servers"),
-    ]
-
-    # Use Nova API for each project
-    nova_endpoints = [
-        "https://api.selectel.ru/v2.1",
-        "https://compute.cloud.selectel.ru/v2.1",
-    ]
-
-    for project in projects:
-        project_id = project.get("id") or project.get("uuid", "")
-        if not project_id:
+        try:
+            token, catalog = get_project_token(username, account_id, password, proj_name)
+        except Exception as e:
+            print(f"      [!] Auth error: {e}")
             continue
 
-        for nova_base in nova_endpoints:
-            try:
-                url = f"{nova_base}/{project_id}/servers/detail"
-                resp = requests.get(url, headers=ks_headers, params={"all_tenants": 0}, timeout=20)
-                if not resp.ok:
-                    continue
-                nova_servers = resp.json().get("servers", [])
+        nova_url = get_nova_url(catalog)
+        if not nova_url:
+            print(f"      [!] No Nova endpoint in catalog, skipping")
+            continue
 
-                for s in nova_servers:
-                    # Extract IP
-                    ip_list = []
-                    for net_name, addrs in s.get("addresses", {}).items():
-                        for addr in addrs:
-                            if addr.get("OS-EXT-IPS:type") == "floating" or addr.get("version") == 4:
-                                ip_list.append(addr.get("addr", ""))
+        try:
+            r = requests.get(f"{nova_url}/servers/detail",
+                             headers={"X-Auth-Token": token},
+                             params={"all_tenants": 0}, timeout=25)
+            r.raise_for_status()
+            nova_servers = r.json().get("servers", [])
+        except Exception as e:
+            print(f"      [!] Nova error: {e}")
+            continue
 
-                    # Flavor / configuration
-                    flavor = s.get("flavor", {})
-                    flavor_name = flavor.get("original_name") or flavor.get("id", "")
-                    vcpu = flavor.get("vcpus", "")
-                    ram_mb = flavor.get("ram", "")
-                    disk_gb = flavor.get("disk", "")
-                    config = flavor_name
-                    if vcpu and ram_mb:
-                        config = f"{flavor_name} ({vcpu} vCPU, {int(ram_mb)//1024}GB RAM, {disk_gb}GB disk)"
+        for s in nova_servers:
+            # IPs — floating first
+            ip_pairs = []
+            for addrs in s.get("addresses", {}).values():
+                for a in addrs:
+                    ip_pairs.append((a.get("OS-EXT-IPS:type", "fixed"), a.get("addr", "")))
+            ip_pairs.sort(key=lambda x: x[0] != "floating")
+            ips = ", ".join(ip for _, ip in ip_pairs if ip) or "—"
 
-                    # OS
-                    image = s.get("image", {})
-                    os_name = ""
-                    if isinstance(image, dict):
-                        os_name = image.get("name", "")
-                    metadata = s.get("metadata", {})
-                    if not os_name:
-                        os_name = metadata.get("os_distro", "") or metadata.get("image_name", "")
+            # Flavor
+            fl = s.get("flavor", {})
+            fname  = fl.get("original_name") or fl.get("id", "")
+            vcpu   = fl.get("vcpus", "")
+            ram_mb = fl.get("ram", "")
+            disk   = fl.get("disk", "")
+            if vcpu and ram_mb:
+                ram_gb = int(ram_mb) // 1024 if str(ram_mb).isdigit() else ram_mb
+                config = f"{fname} ({vcpu} vCPU, {ram_gb} GB RAM, {disk} GB disk)"
+            else:
+                config = fname or "—"
 
-                    # Region from availability zone
-                    az = s.get("OS-EXT-AZ:availability_zone", "")
+            # OS
+            image = s.get("image", {})
+            os_name = (image.get("name") if isinstance(image, dict) else "") \
+                      or s.get("metadata", {}).get("os_distro", "") or "—"
 
-                    # Billing date - not directly in Nova, use created date as fallback
-                    created = s.get("created", "")
-                    updated = s.get("updated", "")
+            az     = s.get("OS-EXT-AZ:availability_zone", "")
+            region = f"{az} / {proj_name}" if az else proj_name
 
-                    servers.append({
-                        "name":          s.get("name", s.get("id", "unknown")),
-                        "ip":            ", ".join(filter(None, ip_list)) or "—",
-                        "configuration": config or "—",
-                        "region":        az or "—",
-                        "os":            os_name or "—",
-                        "billing_date":  "—",  # Cloud servers are billed hourly; see billing panel
-                        "uuid":          s.get("id", ""),
-                        "status":        s.get("status", "—"),
-                        "project_id":    project_id,
-                    })
-                break  # success, stop trying endpoints
-            except Exception:
-                continue
+            all_servers.append({
+                "name":          s.get("name") or s.get("id", "—"),
+                "ip":            ips,
+                "configuration": config,
+                "region":        region,
+                "os":            os_name,
+                "billing_date":  "почасовой",
+            })
 
-    return servers
+    return all_servers
 
 
-# ─── Export helpers ───────────────────────────────────────────────────────────
+# ── Export ────────────────────────────────────────────────────────────────────
 
-COLUMNS = ["name", "ip", "configuration", "region", "os", "billing_date"]
-HEADERS = {
-    "name":          "Имя сервера",
-    "ip":            "IP-адрес",
-    "configuration": "Конфигурация",
-    "region":        "Регион",
-    "os":            "Операционная система",
-    "billing_date":  "Дата оплаты",
-}
+COLS      = ["name", "ip", "configuration", "region", "os", "billing_date"]
+HEADS_RU  = ["Имя сервера", "IP-адрес", "Конфигурация", "Регион", "Операционная система", "Дата оплаты"]
+COL_W     = [28, 22, 50, 28, 34, 15]
 
 
-def save_json(dedicated, cloud, path):
-    output = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "dedicated_servers": dedicated,
-        "cloud_servers": cloud,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-    print(f"  ✓ JSON saved: {path}")
-
-
-def _header_fill():
-    return PatternFill("solid", start_color="1F3864")
-
-
-def _alt_fill():
-    return PatternFill("solid", start_color="DCE6F1")
-
-
-def _thin_border():
-    s = Side(style="thin", color="AAAAAA")
+def _thin():
+    s = Side(style="thin", color="B0B8C8")
     return Border(left=s, right=s, top=s, bottom=s)
 
 
 def _write_sheet(ws, servers, title):
     ws.title = title
+    n = len(COLS)
 
-    # Title row
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(COLUMNS))
-    title_cell = ws.cell(row=1, column=1, value=title)
-    title_cell.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
-    title_cell.fill = PatternFill("solid", start_color="1F3864")
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n)
+    tc = ws.cell(row=1, column=1, value=title)
+    tc.font      = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    tc.fill      = PatternFill("solid", start_color="1B3A6B")
+    tc.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
 
-    # Header row
-    for col_idx, col_key in enumerate(COLUMNS, start=1):
-        cell = ws.cell(row=2, column=col_idx, value=HEADERS[col_key])
-        cell.font = Font(name="Arial", bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", start_color="2E75B6")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = _thin_border()
-    ws.row_dimensions[2].height = 22
+    for ci, h in enumerate(HEADS_RU, 1):
+        c = ws.cell(row=2, column=ci, value=h)
+        c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill      = PatternFill("solid", start_color="2E75B6")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = _thin()
+    ws.row_dimensions[2].height = 24
 
-    # Data rows
-    for row_idx, server in enumerate(servers, start=3):
-        fill = _alt_fill() if row_idx % 2 == 0 else PatternFill("solid", start_color="FFFFFF")
-        for col_idx, col_key in enumerate(COLUMNS, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=server.get(col_key, "—"))
-            cell.font = Font(name="Arial", size=10)
-            cell.fill = fill
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            cell.border = _thin_border()
-        ws.row_dimensions[row_idx].height = 18
+    for ri, srv in enumerate(servers, 3):
+        bg = "EAF0FB" if ri % 2 == 0 else "FFFFFF"
+        fill = PatternFill("solid", start_color=bg)
+        for ci, key in enumerate(COLS, 1):
+            c = ws.cell(row=ri, column=ci, value=srv.get(key, "—"))
+            c.font      = Font(name="Arial", size=10)
+            c.fill      = fill
+            c.alignment = Alignment(vertical="center", wrap_text=(ci == 3))
+            c.border    = _thin()
+        ws.row_dimensions[ri].height = 18
 
-    # Summary row
-    summary_row = len(servers) + 3
-    ws.cell(row=summary_row, column=1, value=f"Всего серверов: {len(servers)}")
-    ws.cell(row=summary_row, column=1).font = Font(name="Arial", bold=True, italic=True)
+    sc = ws.cell(row=len(servers) + 3, column=1, value=f"Итого: {len(servers)}")
+    sc.font = Font(name="Arial", bold=True, italic=True, color="1B3A6B")
 
-    # Column widths
-    col_widths = [30, 22, 45, 20, 35, 15]
-    for i, width in enumerate(col_widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-    # Freeze header
+    for i, w in enumerate(COL_W, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A3"
+
+
+def save_json(dedicated, cloud, path):
+    obj = {
+        "generated_at":      datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dedicated_servers": dedicated,
+        "cloud_servers":     cloud,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    print(f"  ✓ JSON  → {path}")
 
 
 def save_excel(dedicated, cloud, path):
     wb = Workbook()
-    ws_dedicated = wb.active
-    _write_sheet(ws_dedicated, dedicated, "Выделенные серверы")
-
-    ws_cloud = wb.create_sheet()
-    _write_sheet(ws_cloud, cloud, "Облачные серверы")
-
+    _write_sheet(wb.active, dedicated, "Выделенные серверы")
+    _write_sheet(wb.create_sheet(), cloud, "Облачные серверы")
     wb.save(path)
-    print(f"  ✓ Excel saved: {path}")
+    print(f"  ✓ Excel → {path}")
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    token, keystone_token = get_token()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path  = f"/mnt/user-data/outputs/selectel_servers_{timestamp}.json"
-    excel_path = f"/mnt/user-data/outputs/selectel_servers_{timestamp}.xlsx"
+    args = parse_args()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_json = f"/mnt/user-data/outputs/selectel_servers_{ts}.json"
+    out_xlsx = f"/mnt/user-data/outputs/selectel_servers_{ts}.xlsx"
 
-    print("=" * 55)
+    print("=" * 60)
     print("  Selectel Server Inventory")
-    print("=" * 55)
+    print("=" * 60)
 
-    print("\n[1/2] Fetching dedicated servers...")
-    dedicated = fetch_dedicated_servers(token)
-    print(f"      Found: {len(dedicated)} dedicated server(s)")
+    print("\n[auth] Getting account IAM token...")
+    try:
+        acc_token = get_account_token(args.username, args.account, args.password)
+        print("       ✓ OK (valid 24h)")
+    except Exception as e:
+        print(f"       ✗ Failed: {e}")
+        sys.exit(1)
 
-    print("\n[2/2] Fetching cloud (virtual) servers...")
-    cloud = fetch_cloud_servers(token, keystone_token)
-    print(f"      Found: {len(cloud)} cloud server(s)")
+    print("\n[1/2] Dedicated servers...")
+    dedicated = fetch_dedicated(acc_token)
+    print(f"      Found: {len(dedicated)}")
 
-    print("\n[Saving] Exporting results...")
-    save_json(dedicated, cloud, json_path)
-    save_excel(dedicated, cloud, excel_path)
+    print("\n[2/2] Cloud (virtual) servers...")
+    projects = []
+    try:
+        projects = list_projects(acc_token)
+        print(f"      Projects: {len(projects)}")
+    except Exception as e:
+        print(f"      [!] Project list error: {e}")
 
-    print("\n" + "=" * 55)
-    print(f"  Done! Files saved:")
-    print(f"    JSON:  {json_path}")
-    print(f"    Excel: {excel_path}")
-    print("=" * 55)
+    cloud = fetch_cloud(args.username, args.account, args.password, projects) if projects else []
+    print(f"      Found: {len(cloud)}")
+
+    print("\n[save] Writing files...")
+    save_json(dedicated, cloud, out_json)
+    save_excel(dedicated, cloud, out_xlsx)
+
+    print(f"\n{'='*60}")
+    print(f"  Done!")
+    print(f"    JSON:  {out_json}")
+    print(f"    Excel: {out_xlsx}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
